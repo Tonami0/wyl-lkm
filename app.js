@@ -4,15 +4,56 @@
  */
 import { defaultData } from './data.js';
       const STORE_KEY = 'love-memories-data-v1';
-      let data = loadData();
+      const DEFAULT_STORE_URL = 'https://jsonblob.com/api/jsonBlob/019fae03-b566-7ae9-9bb2-732cca90c76c';
+      const STORE_URL_KEY = 'love-memories-store-url-v1';
+      let data = clone(defaultData);
       let activePlaceId = data.places[0]?.id;
       let map, markers = [], currentSlide = 0;
       let calendarCursor = new Date();
       let selectedCalendarDate = formatDate(new Date());
+      let syncTimer = null;
       const $ = (selector, scope=document) => scope.querySelector(selector);
       const $$ = (selector, scope=document) => [...scope.querySelectorAll(selector)];
       function clone(obj){ return JSON.parse(JSON.stringify(obj)); }
-      function loadData(){ try { const saved = localStorage.getItem(STORE_KEY); return saved ? {...clone(defaultData), ...JSON.parse(saved)} : clone(defaultData); } catch { return clone(defaultData); } }
+      function getStoreUrl(){
+        const params = new URLSearchParams(window.location.search);
+        const fromQuery = params.get('store');
+        if (fromQuery) return fromQuery;
+        const fromStorage = localStorage.getItem(STORE_URL_KEY);
+        return fromStorage || DEFAULT_STORE_URL;
+      }
+      const storeUrl = getStoreUrl();
+      function setStoreUrl(url){
+        const normalized = (url || DEFAULT_STORE_URL).trim();
+        localStorage.setItem(STORE_URL_KEY, normalized);
+        return normalized;
+      }
+      async function loadRemoteData(){
+        if (!storeUrl) return null;
+        try {
+          const response = await fetch(storeUrl, { cache: 'no-store' });
+          if (!response.ok) return null;
+          const parsed = await response.json();
+          if (parsed && typeof parsed === 'object' && Array.isArray(parsed.places) && Array.isArray(parsed.events)) {
+            return { ...clone(defaultData), ...parsed };
+          }
+        } catch {}
+        return null;
+      }
+      async function loadData(){
+        try {
+          const saved = localStorage.getItem(STORE_KEY);
+          const localData = saved ? { ...clone(defaultData), ...JSON.parse(saved) } : clone(defaultData);
+          const remoteData = await loadRemoteData();
+          if (remoteData) {
+            localStorage.setItem(STORE_KEY, JSON.stringify(remoteData));
+            return remoteData;
+          }
+          return localData;
+        } catch {
+          return clone(defaultData);
+        }
+      }
       function formatDate(date){ const d = typeof date === 'string' ? new Date(date + 'T12:00:00') : date; return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; }
       function dateText(date){ return new Intl.DateTimeFormat('zh-CN',{year:'numeric',month:'long',day:'numeric',weekday:'short'}).format(new Date(date+'T12:00:00')); }
       function escapeHtml(value=''){ return String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
@@ -138,7 +179,43 @@ import { defaultData } from './data.js';
       function isDataPhoto(photo){ return typeof photo==='string' && /^data:image\/(png|jpe?g|webp|gif);base64,/i.test(photo); }
       function photoLabel(photo){ return isDataPhoto(photo)?'我们拍下的照片':(photo||'一张照片'); }
       function readPhoto(file){ return new Promise((resolve,reject)=>{ const reader=new FileReader(); reader.onload=()=>resolve(reader.result); reader.onerror=reject; reader.readAsDataURL(file); }); }
-      function saveData(){ localStorage.setItem(STORE_KEY, JSON.stringify(data)); renderAll(); updatePrivacy(); }
+      async function saveData(){
+        const snapshot = clone(data);
+        localStorage.setItem(STORE_KEY, JSON.stringify(snapshot));
+        renderAll();
+        updatePrivacy();
+        if (!storeUrl) return;
+        try {
+          const response = await fetch(storeUrl, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(snapshot), cache: 'no-store' });
+          if (!response.ok) throw new Error('cloud save failed');
+          showToast('已同步到共享数据');
+        } catch {
+          showToast('已保存到本地，云端同步稍后重试');
+        }
+      }
+      async function syncDataFromCloud(showToastMessage=false){
+        if (!storeUrl) return;
+        try {
+          const response = await fetch(storeUrl, { cache: 'no-store' });
+          if (!response.ok) return;
+          const parsed = await response.json();
+          if (parsed && typeof parsed === 'object' && Array.isArray(parsed.places) && Array.isArray(parsed.events)) {
+            const merged = { ...clone(defaultData), ...parsed };
+            const changed = JSON.stringify(data) !== JSON.stringify(merged);
+            if (changed) {
+              data = merged;
+              activePlaceId = data.places[0]?.id;
+              renderAll();
+              updatePrivacy();
+              if (showToastMessage) showToast('已同步到最新内容');
+            }
+          }
+        } catch {}
+      }
+      function startSyncPolling(){
+        if (syncTimer) clearInterval(syncTimer);
+        syncTimer = setInterval(() => syncDataFromCloud(false), 4000);
+      }
       function renderPlacePanel(){
         const p=data.places.find(x=>x.id===activePlaceId)||data.places[0], panel=$('#place-panel');
         if(!p){panel.innerHTML='<p class="empty-note">还没有地点。去添加第一枚标记吧。</p>';return;}
@@ -171,5 +248,16 @@ import { defaultData } from './data.js';
         if(e.target.id==='unlock-form'){const candidate=$('#unlock-password').value;if(candidate===data.password){sessionStorage.setItem('love-memories-unlocked','yes');$('#lock-screen').classList.remove('show');$('#unlock-error').textContent='';}else $('#unlock-error').textContent='密码不正确，请再试一次。';}
       }
       document.addEventListener('click',e=>{ const button=e.target.closest('button'); if(!button)return; const action=button.dataset.action; if(action==='edit-event'){const event=data.events.find(x=>x.id===button.dataset.id);if(event)openEventForm(event);} if(action==='edit-place'){const place=data.places.find(x=>x.id===button.dataset.id);if(place)openPlaceForm(place);} if(action==='delete-place'&&confirm('确定删除这个地点和它的照片吗？')){data.places=data.places.filter(x=>x.id!==button.dataset.id);activePlaceId=data.places[0]?.id;saveData();closeModal();showToast('地点已删除');} });
-      function boot(){ fillCities(); renderAll(); initMap(); updatePrivacy(); if(data.password&&sessionStorage.getItem('love-memories-unlocked')!=='yes') $('#lock-screen').classList.add('show'); }
+      async function boot(){
+        const loaded = await loadData();
+        data = loaded;
+        activePlaceId = data.places[0]?.id;
+        fillCities();
+        renderAll();
+        initMap();
+        updatePrivacy();
+        startSyncPolling();
+        window.addEventListener('focus', () => syncDataFromCloud(false));
+        if(data.password&&sessionStorage.getItem('love-memories-unlocked')!=='yes') $('#lock-screen').classList.add('show');
+      }
       boot();
